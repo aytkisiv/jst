@@ -7,7 +7,8 @@ const MODEL       = 'claude-sonnet-4-6';
 const MODEL_FAST  = 'claude-haiku-4-5-20251001'; // for simple structured tasks (test questions)
 const TIMEOUT_MS  = 15000;
 
-const TUTOR_PROMPT_PATH = path.join(__dirname, '../../claude-code-files/prompts/tutor-system.md');
+const TUTOR_PROMPT_PATH  = path.join(__dirname, '../../claude-code-files/prompts/tutor-system.md');
+const VOICE_PROMPT_PATH  = path.join(__dirname, '../../claude-code-files/prompts/voice-tutor.md');
 
 const PERSONALITIES = {
   bro: `Who: The user's chill older friend who studied abroad and genuinely wants to help.
@@ -55,6 +56,18 @@ Praise RU: "ВЕРНО. Загружаю +10 XP в ваш кортекс. Обр
 Correction RU: "ОТРИЦАТЕЛЬНО. Обнаружена ошибка в грамматической матрице. Перекалибровка... правильная форма:"
 NEVER: normal small talk, wisdom, warmth (may attempt warmth but execute it wrongly), "bro", slang.`,
 };
+
+/** @returns {string} voice system prompt — plain text, no JSON */
+function loadVoicePrompt(level, character) {
+  const raw = fs.readFileSync(VOICE_PROMPT_PATH, 'utf8');
+  const match = raw.match(/```\n([\s\S]*?)```/);
+  const prompt = match ? match[1] : raw;
+  const key = character.toLowerCase();
+  const personality = PERSONALITIES[key] ?? PERSONALITIES.bro;
+  return prompt
+    .replace('{level}', level.toUpperCase())
+    .replace('{personality}', personality);
+}
 
 /** @returns {string} system prompt with level and personality injected */
 function loadTutorPrompt(level, character) {
@@ -190,21 +203,41 @@ async function sendMessage({ level, character, history, userMessage }) {
  * Returns { parsed, raw } when complete.
  */
 async function streamMessage({ level, character, history, userMessage, voiceMode = false, onReplyDelta }) {
-  let systemPrompt = loadTutorPrompt(level, character);
-  if (voiceMode) {
-    systemPrompt += '\n\nVOICE MODE ACTIVE: Your reply will be spoken aloud. Keep "reply" to ONE short sentence max. No markdown — no **bold**, no `backticks`, no bullet points. Plain conversational speech only. Match the user\'s language (Russian → reply in Russian, English → reply in English). Still return valid JSON.';
-  }
   const messages = [...history, { role: 'user', content: userMessage }];
 
-  // Voice mode uses Haiku — one sentence response doesn't need Sonnet's depth
-  const model = voiceMode ? MODEL_FAST : MODEL;
+  // ── VOICE MODE: plain text, no JSON ───────────────────────────────────────
+  if (voiceMode) {
+    const systemPrompt = loadVoicePrompt(level, character);
+    let raw = '';
 
+    const stream = client.messages.stream(
+      { model: MODEL_FAST, max_tokens: 300, system: systemPrompt, messages },
+      { signal: AbortSignal.timeout(TIMEOUT_MS) },
+    );
+
+    for await (const event of stream) {
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+        const chunk = event.delta.text;
+        raw += chunk;
+        onReplyDelta(chunk);
+      }
+    }
+
+    const reply = raw.trim() || FALLBACK_RESPONSE.reply;
+    return {
+      parsed: { reply, mood: 'happy', is_correct: true, correction: null, check_question: null, xp_earned: 5 },
+      raw,
+    };
+  }
+
+  // ── TEXT MODE: JSON response ───────────────────────────────────────────────
+  const systemPrompt = loadTutorPrompt(level, character);
   let raw = '';
   let replyExtracted = false;
   let replyStart = -1;
 
   const stream = client.messages.stream(
-    { model, max_tokens: 700, system: systemPrompt, messages },
+    { model: MODEL, max_tokens: 700, system: systemPrompt, messages },
     { signal: AbortSignal.timeout(TIMEOUT_MS) },
   );
 
@@ -213,10 +246,8 @@ async function streamMessage({ level, character, history, userMessage, voiceMode
       const chunk = event.delta.text;
       raw += chunk;
 
-      // Extract the "reply" field content incrementally as tokens arrive
       if (!replyExtracted) {
         if (replyStart === -1) {
-          // Find the opening of the reply value: "reply": "
           const marker = raw.indexOf('"reply"');
           if (marker !== -1) {
             const afterKey = raw.slice(marker + 7);
@@ -224,29 +255,22 @@ async function streamMessage({ level, character, history, userMessage, voiceMode
             if (colon !== -1) {
               const afterColon = afterKey.slice(colon + 1).trimStart();
               if (afterColon.startsWith('"')) {
-                replyStart = raw.length - (afterColon.length - 1); // position of first char after opening "
+                replyStart = raw.length - (afterColon.length - 1);
               }
             }
           }
         } else {
-          // We know where reply starts; find if it just closed
           const replyContent = raw.slice(replyStart);
-          // Look for unescaped closing quote
           let end = -1;
           for (let i = 0; i < replyContent.length; i++) {
             if (replyContent[i] === '"' && (i === 0 || replyContent[i - 1] !== '\\')) {
-              end = i;
-              break;
+              end = i; break;
             }
           }
-
           if (end === -1) {
-            // Still building — emit new chunk of the reply text
             onReplyDelta(chunk);
           } else {
-            // Reply field just closed
             replyExtracted = true;
-            // Emit any remaining reply text before the closing quote
             const prevLen = raw.length - chunk.length - replyStart;
             if (prevLen < end) onReplyDelta(replyContent.slice(prevLen, end));
           }
@@ -257,9 +281,8 @@ async function streamMessage({ level, character, history, userMessage, voiceMode
 
   let parsed = tryParseJSON(raw);
 
-  // If streaming produced invalid JSON, do one non-streaming retry with a JSON reminder
   if (!parsed) {
-    console.warn('[claude] streamMessage: invalid JSON — retrying with JSON reminder');
+    console.warn('[claude] streamMessage: invalid JSON — retrying');
     const retryMessages = [
       ...messages,
       { role: 'assistant', content: raw },
@@ -268,7 +291,6 @@ async function streamMessage({ level, character, history, userMessage, voiceMode
     try {
       const retryRaw = await callClaude(systemPrompt, retryMessages);
       parsed = tryParseJSON(retryRaw) ?? { ...FALLBACK_RESPONSE };
-      // Emit the reply text from the retry result so the UI shows something
       if (parsed.reply) onReplyDelta(parsed.reply);
     } catch {
       parsed = { ...FALLBACK_RESPONSE };
