@@ -1,7 +1,7 @@
 const { Router } = require('express');
 const fs = require('fs');
 const path = require('path');
-const { callClaude } = require('../services/claude');
+const { callClaude, MODEL_FAST } = require('../services/claude');
 const db = require('../db/queries');
 const { aiRateLimit } = require('../middleware/rateLimit');
 
@@ -17,7 +17,6 @@ function extractPrompt(tag) {
 }
 
 function loadBulkQuestionsPrompt() { return extractPrompt('bulk-questions'); }
-function loadVerdictPrompt() { return extractPrompt('verdict'); }
 
 /** System prompt for adaptive single-question generation. */
 function adaptiveQuestionPrompt(difficulty) {
@@ -98,6 +97,48 @@ function buildHistory(previousAnswers) {
   return messages;
 }
 
+const VERDICT_MESSAGES = {
+  a1:     'Ты только начинаешь — и это отлично! Начнём с самого начала.',
+  a2:     'Базу знаешь, но правила ещё расплывчатые. Разберёмся вместе.',
+  b1:     'Понимаешь суть, но иногда путаешь времена. Отточим детали.',
+  b2:     'Крепкая база! Осталось поработать над нюансами.',
+  b2plus: 'Очень сильно! Займёмся сложными случаями.',
+  c1:     'Впечатляет — ты реально знаешь язык. Углубимся в тонкости.',
+};
+
+/**
+ * Compute level verdict from answers without calling Claude.
+ * @param {{ difficulty: string, selected: string, correct: string }[]} answers
+ * @returns {{ score: number, level: string, message: string, focus: string }}
+ */
+function scoreVerdict(answers) {
+  const score = answers.filter((a) => a.selected === a.correct).length;
+  const hardCorrect   = answers.filter((a) => a.difficulty === 'hard'   && a.selected === a.correct).length;
+  const mediumCorrect = answers.filter((a) => a.difficulty === 'medium' && a.selected === a.correct).length;
+  const easyCorrect   = answers.filter((a) => a.difficulty === 'easy'   && a.selected === a.correct).length;
+
+  let level;
+  if (score <= 1 && easyCorrect === 0)         level = 'a1';
+  else if (score <= 2 && hardCorrect === 0 && mediumCorrect <= 1) level = 'a2';
+  else if (score <= 3 || (score <= 4 && hardCorrect === 0))       level = 'b1';
+  else if (score === 4 && hardCorrect <= 1)    level = 'b2';
+  else if (score === 5 && hardCorrect <= 1)    level = 'b2';
+  else if (score === 5 && hardCorrect >= 2)    level = 'b2plus';
+  else                                          level = 'c1';
+
+  const wrongTopics = answers
+    .filter((a) => a.selected !== a.correct)
+    .map((a) => a.difficulty)
+    .join(', ');
+
+  return {
+    score,
+    level,
+    message: VERDICT_MESSAGES[level],
+    focus: wrongTopics || 'Keep practising all tenses',
+  };
+}
+
 function tryParseJSON(raw) {
   // Strip code fences
   let cleaned = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
@@ -125,7 +166,7 @@ router.post('/questions', aiRateLimit, async (req, res, next) => {
     const systemPrompt = loadBulkQuestionsPrompt();
     const messages = [{ role: 'user', content: 'Generate the 6 test questions now.' }];
 
-    const raw = await callClaude(systemPrompt, messages, 2048);
+    const raw = await callClaude(systemPrompt, messages, 2048, MODEL_FAST);
     const questions = tryParseJSON(raw);
 
     if (!Array.isArray(questions) || questions.length < 6) {
@@ -149,33 +190,11 @@ router.post('/question', aiRateLimit, async (req, res, next) => {
       return res.status(400).json({ data: null, error: 'user_id is required' });
     }
 
-    // After 6 answers → generate verdict
+    // After 6 answers → compute verdict locally (no Claude needed)
     if (previous_answers.length >= 6) {
-      const systemPrompt = loadVerdictPrompt();
-      const summary = previous_answers.map((a) =>
-        `Q${a.number} [${a.difficulty ?? 'medium'}]: "${a.question}" — correct: ${a.correct ?? '?'}, user chose: ${a.selected}`
-      ).join('\n');
-      const messages = [{ role: 'user', content: `Here are the 6 answers:\n${summary}\n\nProvide the verdict now.` }];
-
-      const raw = await callClaude(systemPrompt, messages);
-      const verdict = tryParseJSON(raw);
-
-      if (verdict) {
-        await db.upsertProgress(user_id, { level: verdict.level });
-      }
-
-      const score = previous_answers.filter((a) => a.selected === a.correct).length;
-
-      return res.json({
-        data: {
-          type: 'verdict',
-          score: verdict?.score ?? score,
-          level: verdict?.level ?? 'b1',
-          message: verdict?.message ?? '',
-          focus: verdict?.focus ?? '',
-        },
-        error: null,
-      });
+      const verdict = scoreVerdict(previous_answers);
+      await db.upsertProgress(user_id, { level: verdict.level });
+      return res.json({ data: { type: 'verdict', ...verdict }, error: null });
     }
 
     // Generate next adaptive question
@@ -221,28 +240,9 @@ router.post('/complete', aiRateLimit, async (req, res, next) => {
       return res.status(400).json({ data: null, error: 'answers array is required' });
     }
 
-    const systemPrompt = loadVerdictPrompt();
-    const summary = answers.map((a) =>
-      `Q${a.number} [${a.difficulty}]: "${a.question}" — correct: ${a.correct ?? '?'}, user chose: ${a.selected}`
-    ).join('\n');
-    const messages = [{ role: 'user', content: `Here are the 6 answers:\n${summary}\n\nProvide the verdict now.` }];
-
-    const raw = await callClaude(systemPrompt, messages);
-    const verdict = tryParseJSON(raw);
-
-    if (verdict?.level) {
-      await db.upsertProgress(user_id, { level: verdict.level });
-    }
-
-    return res.json({
-      data: {
-        level: verdict?.level ?? 'b1',
-        score: verdict?.score ?? 0,
-        message: verdict?.message ?? '',
-        focus: verdict?.focus ?? '',
-      },
-      error: null,
-    });
+    const verdict = scoreVerdict(answers);
+    await db.upsertProgress(user_id, { level: verdict.level });
+    return res.json({ data: verdict, error: null });
   } catch (err) {
     next(err);
   }

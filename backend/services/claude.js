@@ -3,8 +3,9 @@ const fs = require('fs');
 const path = require('path');
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const MODEL = 'claude-sonnet-4-6';
-const TIMEOUT_MS = 15000;
+const MODEL       = 'claude-sonnet-4-6';
+const MODEL_FAST  = 'claude-haiku-4-5-20251001'; // for simple structured tasks (test questions)
+const TIMEOUT_MS  = 15000;
 
 const TUTOR_PROMPT_PATH = path.join(__dirname, '../../claude-code-files/prompts/tutor-system.md');
 
@@ -87,10 +88,10 @@ function extractMoodTag(text) {
  * @param {{ role: string, content: string }[]} messages
  * @returns {Promise<string>} raw text response
  */
-async function callClaude(systemPrompt, messages, maxTokens = 512) {
+async function callClaude(systemPrompt, messages, maxTokens = 512, model = MODEL) {
   const attempt = async () => {
     const response = await client.messages.create(
-      { model: MODEL, max_tokens: maxTokens, system: systemPrompt, messages },
+      { model, max_tokens: maxTokens, system: systemPrompt, messages },
       { timeout: TIMEOUT_MS }
     );
     return response.content[0].text;
@@ -195,12 +196,15 @@ async function streamMessage({ level, character, history, userMessage, voiceMode
   }
   const messages = [...history, { role: 'user', content: userMessage }];
 
+  // Voice mode uses Haiku — one sentence response doesn't need Sonnet's depth
+  const model = voiceMode ? MODEL_FAST : MODEL;
+
   let raw = '';
   let replyExtracted = false;
   let replyStart = -1;
 
   const stream = client.messages.stream(
-    { model: MODEL, max_tokens: 700, system: systemPrompt, messages },
+    { model, max_tokens: 700, system: systemPrompt, messages },
     { signal: AbortSignal.timeout(TIMEOUT_MS) },
   );
 
@@ -282,4 +286,4 @@ async function streamMessage({ level, character, history, userMessage, voiceMode
   return { parsed, raw };
 }
 
-module.exports = { callClaude, sendMessage, streamMessage };
+module.exports = { callClaude, sendMessage, streamMessage, MODEL_FAST };
