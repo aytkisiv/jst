@@ -125,11 +125,15 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
   const [micError,  setMicError]  = useState('');
   const [listenMode, setListenMode] = useState('auto'); // 'auto' | 'hold'
 
-  const timerRef      = useRef(null);
-  const lastMsgId     = useRef(lastTutorMsg?.id ?? null);
-  const sentRef       = useRef(false);
-  const hasSpokenRef  = useRef(false);
-  const emptyRetryRef = useRef(0); // limit auto-retries on empty transcript
+
+  const timerRef        = useRef(null);
+  const lastMsgId       = useRef(lastTutorMsg?.id ?? null);
+  const sentRef         = useRef(false);
+  const hasSpokenRef    = useRef(false);
+  const emptyRetryRef   = useRef(0);
+  const listenModeRef   = useRef(listenMode); // always-current ref for effects
+
+  useEffect(() => { listenModeRef.current = listenMode; }, [listenMode]);
 
   const character = useGameStore((s) => s.character) ?? 'bro';
   const charName  = CHAR_NAME[character]  ?? 'Bro';
@@ -210,16 +214,18 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // On open: always start listening immediately — user speaks first
+  // On open: auto mode → start listening; hold mode → wait for user to press orb
   useEffect(() => {
-    doListen();
+    if (listenModeRef.current === 'auto') doListen();
+    else setPhase('idle');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Speaking finished naturally → start listening
+  // Speaking finished naturally → auto: start listening; hold: go idle (user initiates)
   useEffect(() => {
     if (!isSpeaking && phase === 'speaking') {
-      doListen();
+      if (listenModeRef.current === 'auto') doListen();
+      else setPhase('idle');
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isSpeaking]);
