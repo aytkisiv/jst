@@ -115,7 +115,11 @@ export default function useVoice({ onSpeechEnd, onSpeechEmpty } = {}) {
     }
   }
 
-  const startListening = useCallback(async () => {
+  /**
+   * Start recording. Pass { noVAD: true } for push-to-talk mode —
+   * recording continues until stopListening() is called manually.
+   */
+  const startListening = useCallback(async ({ noVAD = false } = {}) => {
     if (isListening) return;
 
     try {
@@ -147,11 +151,13 @@ export default function useVoice({ onSpeechEnd, onSpeechEmpty } = {}) {
       recorder.start(100);
       setIsListening(true);
 
-      _startVAD(stream, () => {
-        if (mediaRecorderRef.current?.state === 'recording') {
-          mediaRecorderRef.current.stop();
-        }
-      });
+      if (!noVAD) {
+        _startVAD(stream, () => {
+          if (mediaRecorderRef.current?.state === 'recording') {
+            mediaRecorderRef.current.stop();
+          }
+        });
+      }
     } catch (err) {
       console.warn('[useVoice] mic error:', err.message);
       setIsListening(false);

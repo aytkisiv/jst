@@ -123,6 +123,7 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
   const [userText,  setUserText]  = useState('');
   const [seconds,   setSeconds]   = useState(0);
   const [micError,  setMicError]  = useState('');
+  const [listenMode, setListenMode] = useState('auto'); // 'auto' | 'hold'
 
   const timerRef      = useRef(null);
   const lastMsgId     = useRef(lastTutorMsg?.id ?? null);
@@ -166,15 +167,12 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
     speak(text);
   }
 
-  async function doListen() {
+  async function doListen({ noVAD = false } = {}) {
     setMicError('');
     setPhase('listening');
     try {
-      // Explicitly test mic access to get a clear error
-      if (!navigator.mediaDevices) {
-        throw new Error('HTTP_BLOCKED');
-      }
-      await startListening();
+      if (!navigator.mediaDevices) throw new Error('HTTP_BLOCKED');
+      await startListening({ noVAD });
     } catch (err) {
       const msg = err.message?.includes('HTTP_BLOCKED')
         ? 'Open the site via https:// — microphone requires a secure connection'
@@ -184,6 +182,13 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
       setMicError(msg);
       setPhase('error');
     }
+  }
+
+  // Hold mode: called on pointerUp / pointerLeave — stops recording and sends immediately
+  function handleHoldEnd() {
+    if (listenMode !== 'hold' || phase !== 'listening') return;
+    stopListening();
+    setPhase('processing');
   }
 
   // ── lifecycle ──────────────────────────────────────────
@@ -235,6 +240,12 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
 
   // ── orb tap handler ────────────────────────────────────
   function handleOrbTap() {
+    if (listenMode === 'hold') {
+      // In hold mode tap = interrupt speaking only
+      if (phase === 'speaking') { stopSpeaking(); setPhase('idle'); }
+      return;
+    }
+    // Auto mode
     if (phase === 'speaking') {
       stopSpeaking();
       doListen();
@@ -244,7 +255,13 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
     } else if (phase === 'idle' || phase === 'error') {
       doListen();
     }
-    // processing → do nothing (waiting for server)
+  }
+
+  function handleOrbPointerDown(e) {
+    if (listenMode !== 'hold') return;
+    e.preventDefault();
+    if (phase === 'speaking') stopSpeaking();
+    if (phase !== 'listening') doListen({ noVAD: true });
   }
 
   // ── UI helpers ─────────────────────────────────────────
@@ -253,18 +270,18 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
 
   const HEADINGS = {
     speaking:   `${charName} is speaking…`,
-    listening:  `${charName} is listening…`,
+    listening:  listenMode === 'hold' ? 'Recording…' : `${charName} is listening…`,
     processing: 'Thinking…',
-    idle:       'Tap orb to speak',
+    idle:       listenMode === 'hold' ? 'Hold orb to speak' : 'Tap orb to speak',
     error:      'Microphone error',
   };
 
   const ORB_HINT = {
     speaking:   'Tap to interrupt',
-    listening:  'Tap to stop',
+    listening:  listenMode === 'hold' ? 'Release to send' : 'Tap to stop',
     processing: '',
-    idle:       'Tap to speak',
-    error:      'Tap to retry',
+    idle:       listenMode === 'hold' ? 'Hold orb → release to send' : 'Tap to speak',
+    error:      listenMode === 'hold' ? 'Hold to retry' : 'Tap to retry',
   };
 
   const orbGradient = {
@@ -344,6 +361,9 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
             animate={phase === 'speaking' ? { scale:[1,1.05,1] } : { scale:1 }}
             transition={phase === 'speaking' ? { duration:1.4, repeat:Infinity, ease:'easeInOut' } : { duration:.2 }}
             onClick={handleOrbTap}
+            onPointerDown={handleOrbPointerDown}
+            onPointerUp={handleHoldEnd}
+            onPointerLeave={handleHoldEnd}
             style={{
               position:'relative', zIndex:10,
               width:136, height:136, borderRadius:'50%',
@@ -449,6 +469,22 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
           <span style={{ fontSize:12, fontWeight:600 }}>Switch to text</span>
         </button>
 
+        {/* End voice + mode toggle stacked */}
+        <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:12 }}>
+          {/* Auto / Hold toggle */}
+          <div style={{ display:'flex', background:'rgba(255,255,255,.08)', border:'1px solid rgba(255,255,255,.15)', borderRadius:9999, padding:3, gap:2 }}>
+            {['auto','hold'].map((m) => (
+              <button key={m} onClick={() => setListenMode(m)} style={{
+                background: listenMode === m ? 'rgba(124,92,191,.7)' : 'none',
+                border: 'none', borderRadius:9999,
+                padding:'4px 14px', fontSize:11, fontWeight:700,
+                color: listenMode === m ? 'white' : 'rgba(255,255,255,.45)',
+                cursor:'pointer', textTransform:'uppercase', letterSpacing:'.06em',
+                transition:'all .15s',
+              }}>{m}</button>
+            ))}
+          </div>
+
         {/* End voice */}
         <button className="vo-end-btn" onClick={onClose}>
           <div style={{ width:80, height:80, borderRadius:'50%', background:'#ba1a1a', display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 12px 32px rgba(186,26,26,.4)', border:'1px solid rgba(255,255,255,.15)' }}>
@@ -456,6 +492,7 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
           </div>
           <span style={{ fontSize:14, fontWeight:600, color:'#ffdad6' }}>End voice</span>
         </button>
+        </div>
 
         {/* Skip / speak now */}
         <button className="vo-side-btn"
