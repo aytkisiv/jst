@@ -398,7 +398,7 @@ export default function TutorChat() {
       <AnimatePresence>
         {isVoiceOpen && (
           <VoiceOverlay
-            onSend={(text) => { sendMessage(text); }}
+            onSend={(text) => { sendMessage(text, { voiceMode: true }); }}
             onClose={() => setVoiceOpen(false)}
             lastTutorMsg={[...messages].reverse().find((m) => m.role === 'tutor' && !m.streaming) ?? null}
             isLoading={isLoading}

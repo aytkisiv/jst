@@ -9,6 +9,7 @@ export default function useVoice({ onSpeechEnd, onSpeechEmpty } = {}) {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking,  setIsSpeaking]  = useState(false);
   const [transcript,  setTranscript]  = useState('');
+  const [audioLevel,  setAudioLevel]  = useState(0); // 0-100, live RMS during recording
   const isSupported = !!(navigator.mediaDevices?.getUserMedia);
 
   const mediaRecorderRef  = useRef(null);
@@ -50,11 +51,13 @@ export default function useVoice({ onSpeechEnd, onSpeechEmpty } = {}) {
       analyser.fftSize = 512;
       source.connect(analyser);
 
-      const buf           = new Uint8Array(analyser.fftSize);
-      let   silentMs      = 0;
-      let   lastTs        = performance.now();
-      const SILENCE_RMS   = 10;
-      const SILENCE_MS    = 1500;
+      const buf             = new Uint8Array(analyser.fftSize);
+      let   silentMs        = 0;
+      let   lastTs          = performance.now();
+      const SILENCE_RMS     = 10;
+      const SILENCE_MS      = 2200;  // longer pause before cutting off
+      const MIN_RECORD_MS   = 800;   // don't trigger VAD in first 800ms
+      const startTs         = performance.now();
 
       function tick() {
         vadFrameRef.current = requestAnimationFrame(tick);
@@ -66,6 +69,11 @@ export default function useVoice({ onSpeechEnd, onSpeechEmpty } = {}) {
         let sum = 0;
         for (let i = 0; i < buf.length; i++) sum += Math.abs(buf[i] - 128);
         const rms = sum / buf.length;
+
+        // Skip VAD in the first MIN_RECORD_MS to avoid cutting off fast starters
+        setAudioLevel(Math.min(100, Math.round((rms / 35) * 100)));
+
+        if (now - startTs < MIN_RECORD_MS) return;
 
         if (rms < SILENCE_RMS) {
           silentMs += dt;
@@ -129,6 +137,7 @@ export default function useVoice({ onSpeechEnd, onSpeechEmpty } = {}) {
 
       recorder.onstop = async () => {
         setIsListening(false);
+        setAudioLevel(0);
         streamRef.current?.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
         const blob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' });
@@ -173,7 +182,6 @@ export default function useVoice({ onSpeechEnd, onSpeechEmpty } = {}) {
 
   const speak = useCallback(async (text) => {
     if (!text) return;
-    // Force-reset stuck isSpeaking state before starting
     audioRef.current?.pause();
     audioRef.current = null;
     setIsSpeaking(true);
@@ -190,38 +198,109 @@ export default function useVoice({ onSpeechEnd, onSpeechEmpty } = {}) {
       });
 
       if (!res.ok) throw new Error('tts_unavailable');
-
-      const blob  = await res.blob();
-
       if (abort.signal.aborted) { setIsSpeaking(false); return; }
 
-      const url   = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audio.volume = 1.0;
-      audioRef.current = audio;
-      ttsAbortRef.current = null;
-
-      audio.onended = () => { setIsSpeaking(false); URL.revokeObjectURL(url); };
-      audio.onerror = (e) => {
-        console.warn('[useVoice] audio error:', e);
-        setIsSpeaking(false);
-        URL.revokeObjectURL(url);
-      };
-      audio.play().catch((e) => {
-        console.warn('[useVoice] play() blocked:', e.message);
-        setIsSpeaking(false);
-        URL.revokeObjectURL(url);
-      });
+      // Try streaming playback via MediaSource — starts audio before full download
+      const streamed = await _playStreaming(res, abort.signal);
+      if (!streamed) {
+        // Fallback: wait for full blob (older browsers)
+        const blob = await res.blob();
+        if (abort.signal.aborted) { setIsSpeaking(false); return; }
+        const url   = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        audio.volume = 1.0;
+        audioRef.current = audio;
+        ttsAbortRef.current = null;
+        audio.onended = () => { setIsSpeaking(false); URL.revokeObjectURL(url); };
+        audio.onerror = () => { setIsSpeaking(false); URL.revokeObjectURL(url); };
+        audio.play().catch(() => setIsSpeaking(false));
+      }
     } catch (err) {
       ttsAbortRef.current = null;
       if (err.name === 'AbortError') { setIsSpeaking(false); return; }
       const utt = new SpeechSynthesisUtterance(text);
-      utt.lang   = 'en-US';
-      utt.onend  = () => setIsSpeaking(false);
+      utt.lang    = 'en-US';
+      utt.onend   = () => setIsSpeaking(false);
       utt.onerror = () => setIsSpeaking(false);
       window.speechSynthesis.speak(utt);
     }
-  }, [isSpeaking, character]);
+  }, [character]);
 
-  return { isListening, isSpeaking, isSupported, transcript, startListening, stopListening, speak, stopSpeaking };
+  // Stream TTS audio via MediaSource — plays as chunks arrive instead of waiting for full blob.
+  // Returns true if streaming succeeded, false if MSE not available/supported.
+  async function _playStreaming(res, abortSignal) {
+    if (!window.MediaSource || !MediaSource.isTypeSupported('audio/mpeg')) return false;
+
+    return new Promise((resolve) => {
+      const mediaSource = new MediaSource();
+      const url         = URL.createObjectURL(mediaSource);
+      const audio       = new Audio(url);
+      audio.volume      = 1.0;
+      audioRef.current  = audio;
+      ttsAbortRef.current = null;
+
+      mediaSource.addEventListener('sourceopen', async () => {
+        let sourceBuffer;
+        try {
+          sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+        } catch {
+          URL.revokeObjectURL(url);
+          resolve(false);
+          return;
+        }
+
+        const reader = res.body.getReader();
+        let playStarted = false;
+
+        const appendChunk = (chunk) => new Promise((done) => {
+          const doAppend = () => {
+            try { sourceBuffer.appendBuffer(chunk); } catch { done(); return; }
+            sourceBuffer.addEventListener('updateend', done, { once: true });
+          };
+          sourceBuffer.updating ? sourceBuffer.addEventListener('updateend', doAppend, { once: true }) : doAppend();
+        });
+
+        try {
+          while (!abortSignal?.aborted) {
+            const { done, value } = await reader.read();
+            if (done) {
+              // Wait for any pending append before closing
+              if (sourceBuffer.updating) {
+                await new Promise((d) => sourceBuffer.addEventListener('updateend', d, { once: true }));
+              }
+              mediaSource.endOfStream();
+              break;
+            }
+            await appendChunk(value);
+            // Start playback as soon as first chunk is buffered
+            if (!playStarted) {
+              playStarted = true;
+              audio.play().catch(() => {});
+            }
+          }
+
+          if (abortSignal?.aborted) {
+            audio.pause();
+            URL.revokeObjectURL(url);
+            setIsSpeaking(false);
+            return;
+          }
+
+          audio.onended = () => { setIsSpeaking(false); URL.revokeObjectURL(url); };
+          audio.onerror = () => { setIsSpeaking(false); URL.revokeObjectURL(url); };
+          resolve(true);
+        } catch {
+          URL.revokeObjectURL(url);
+          resolve(false);
+        }
+      }, { once: true });
+
+      // If sourceopen never fires, fall back
+      setTimeout(() => {
+        if (mediaSource.readyState !== 'open') { URL.revokeObjectURL(url); resolve(false); }
+      }, 3000);
+    });
+  }
+
+  return { isListening, isSpeaking, isSupported, transcript, audioLevel, startListening, stopListening, speak, stopSpeaking };
 }

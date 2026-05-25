@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const MODEL = 'claude-haiku-4-5-20251001';
+const MODEL = 'claude-sonnet-4-6';
 const TIMEOUT_MS = 15000;
 
 const TUTOR_PROMPT_PATH = path.join(__dirname, '../../claude-code-files/prompts/tutor-system.md');
@@ -106,7 +106,7 @@ async function callClaude(systemPrompt, messages, maxTokens = 512) {
 
 /** Fallback response returned when Claude produces unparse-able JSON. */
 const FALLBACK_RESPONSE = {
-  reply: "Hmm, let me think about that... Could you say it again?",
+  reply: "Could you say that again?",
   mood: 'thinking',
   is_correct: true,
   correction: null,
@@ -188,20 +188,21 @@ async function sendMessage({ level, character, history, userMessage }) {
  * Stream a tutor message. Calls onReplyDelta with each text chunk of the reply field.
  * Returns { parsed, raw } when complete.
  */
-async function streamMessage({ level, character, history, userMessage, onReplyDelta }) {
-  const systemPrompt = loadTutorPrompt(level, character);
+async function streamMessage({ level, character, history, userMessage, voiceMode = false, onReplyDelta }) {
+  let systemPrompt = loadTutorPrompt(level, character);
+  if (voiceMode) {
+    systemPrompt += '\n\nVOICE MODE ACTIVE: Your reply will be spoken aloud. Keep "reply" to ONE short sentence max. No markdown — no **bold**, no `backticks`, no bullet points. Plain conversational speech only. Match the user\'s language (Russian → reply in Russian, English → reply in English). Still return valid JSON.';
+  }
   const messages = [...history, { role: 'user', content: userMessage }];
 
   let raw = '';
   let replyExtracted = false;
   let replyStart = -1;
 
-  const stream = client.messages.stream({
-    model: MODEL,
-    max_tokens: 512,
-    system: systemPrompt,
-    messages,
-  });
+  const stream = client.messages.stream(
+    { model: MODEL, max_tokens: 700, system: systemPrompt, messages },
+    { signal: AbortSignal.timeout(TIMEOUT_MS) },
+  );
 
   for await (const event of stream) {
     if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
@@ -250,7 +251,25 @@ async function streamMessage({ level, character, history, userMessage, onReplyDe
     }
   }
 
-  const parsed = tryParseJSON(raw) ?? { ...FALLBACK_RESPONSE };
+  let parsed = tryParseJSON(raw);
+
+  // If streaming produced invalid JSON, do one non-streaming retry with a JSON reminder
+  if (!parsed) {
+    console.warn('[claude] streamMessage: invalid JSON — retrying with JSON reminder');
+    const retryMessages = [
+      ...messages,
+      { role: 'assistant', content: raw },
+      { role: 'user', content: 'Your response was not valid JSON. Reply ONLY with a valid JSON object matching the required format.' },
+    ];
+    try {
+      const retryRaw = await callClaude(systemPrompt, retryMessages);
+      parsed = tryParseJSON(retryRaw) ?? { ...FALLBACK_RESPONSE };
+      // Emit the reply text from the retry result so the UI shows something
+      if (parsed.reply) onReplyDelta(parsed.reply);
+    } catch {
+      parsed = { ...FALLBACK_RESPONSE };
+    }
+  }
 
   if (parsed.reply) {
     const { text, mood } = extractMoodTag(parsed.reply);

@@ -84,6 +84,29 @@ const KeyboardIcon = () => (
   </svg>
 );
 
+// Multipliers per bar give a natural uneven waveform shape
+const BAR_MULTS = [0.5, 0.85, 1.0, 0.9, 0.6, 0.75, 0.45];
+
+function AudioBars({ level }) {
+  const MIN_H = 4;
+  const MAX_H = 26;
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, height: 30, verticalAlign: 'middle' }}>
+      {BAR_MULTS.map((m, i) => (
+        <span key={i} style={{
+          display: 'block',
+          width: 4,
+          borderRadius: 9999,
+          background: 'linear-gradient(to top, #7c5cbf, #fc79bd)',
+          height: `${MIN_H + (MAX_H - MIN_H) * (level / 100) * m}px`,
+          transition: 'height 80ms ease-out',
+          opacity: 0.5 + 0.5 * (level / 100),
+        }} />
+      ))}
+    </span>
+  );
+}
+
 /**
  * Two-way voice dialog overlay.
  * Props:
@@ -113,7 +136,7 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
 
   // ── voice hook ─────────────────────────────────────────
   const {
-    isListening, isSpeaking, isSupported, transcript,
+    isListening, isSpeaking, isSupported, transcript, audioLevel,
     startListening, stopListening, speak, stopSpeaking,
   } = useVoice({
     onSpeechEnd: (text) => {
@@ -404,7 +427,13 @@ export default function VoiceOverlay({ onSend, onClose, lastTutorMsg = null, isL
                 fontStyle: userText || phase === 'error' ? 'normal' : 'italic' }}>
                 {phase === 'error'
                   ? micError
-                  : userText || (phase === 'listening' ? (transcript || 'Listening…') : phase === 'processing' ? 'Sending…' : 'Speak after the chime…')}
+                  : userText
+                  ? userText
+                  : phase === 'listening'
+                  ? <AudioBars level={audioLevel} />
+                  : phase === 'processing'
+                  ? 'Sending…'
+                  : 'Speak after the chime…'}
               </p>
             </div>
           </div>

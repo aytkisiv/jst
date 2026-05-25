@@ -20,7 +20,7 @@ async function getSession(session_id) {
  * Streams reply tokens as they arrive, then sends full metadata at end.
  */
 router.post('/stream', aiRateLimit, async (req, res) => {
-  const { session_id, message, history = [] } = req.body ?? {};
+  const { session_id, message, history = [], voice_mode = false } = req.body ?? {};
   if (!session_id || !message) {
     return res.status(400).json({ error: 'session_id and message are required' });
   }
@@ -44,6 +44,7 @@ router.post('/stream', aiRateLimit, async (req, res) => {
       character: session.character,
       history,
       userMessage: message,
+      voiceMode: voice_mode,
       onReplyDelta: (text) => send({ type: 'delta', text }),
     });
 

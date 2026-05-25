@@ -13,7 +13,7 @@ export default function useTutor() {
   const addXP     = useGameStore((s) => s.addXP);
   const setMood   = useGameStore((s) => s.setMood);
 
-  const sendMessage = useCallback(async (text) => {
+  const sendMessage = useCallback(async (text, { voiceMode = false } = {}) => {
     if (!text.trim() || isLoading) return;
 
     const userMsg = { id: Date.now(), role: 'user', content: text };
@@ -21,8 +21,11 @@ export default function useTutor() {
     setIsLoading(true);
     setError(null);
 
-    const tutorId = Date.now() + 1;
+    const tutorId = crypto.randomUUID();
     setMessages((prev) => [...prev, { id: tutorId, role: 'tutor', content: '', streaming: true }]);
+
+    // Keep last 12 messages as history (6 exchanges) — prevents slowdown on long sessions
+    const recentHistory = messages.slice(-12);
 
     try {
       const res = await fetch('/api/chat/stream', {
@@ -32,7 +35,8 @@ export default function useTutor() {
           session_id: sessionId,
           message: text,
           character: character || 'bro',
-          history: messages.map((m) => ({
+          voice_mode: voiceMode,
+          history: recentHistory.map((m) => ({
             role: m.role === 'tutor' ? 'assistant' : m.role,
             content: m.content,
           })),
